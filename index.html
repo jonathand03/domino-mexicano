@@ -70,7 +70,7 @@
         <div class="grid">
           <div>
             <label>sensibilidade (hough param2)</label>
-            <input type="range" id="param2" min="8" max="40" step="1" value="20">
+            <input type="range" id="param2" min="8" max="60" step="1" value="25">
           </div>
           <div>
             <label>raio mínimo da bolinha (px)</label>
@@ -83,6 +83,10 @@
           <div>
             <label>suavização (blur kernel)</label>
             <input type="range" id="blur" min="3" max="19" step="2" value="9">
+          </div>
+          <div>
+            <label>supressão de overlap (%)</label>
+            <input type="range" id="overlap" min="50" max="100" step="5" value="80">
           </div>
         </div>
         <div class="tip">
@@ -119,6 +123,7 @@
       minR: document.getElementById('minR'),
       maxR: document.getElementById('maxR'),
       blur: document.getElementById('blur'),
+      overlap: document.getElementById('overlap'),
     };
 
     function cvLoadError(){ alert('não consegui carregar o OpenCV.js. verifique sua conexão.'); }
@@ -171,7 +176,7 @@
     }
 
     // ===== OpenCV pipeline =====
-    let src=null, gray=null, circles=null;
+    let gray=null, circles=null;
 
     function onOpenCvReady(){
       // OpenCV carregado, conecta eventos
@@ -202,13 +207,29 @@
 
     function startProcessing(){
       if(!cv || !els.video.videoWidth) return;
-      src && src.delete(); gray && gray.delete(); circles && circles.delete();
-      src = new cv.Mat(els.video.videoHeight, els.video.videoWidth, cv.CV_8UC4);
+      gray && gray.delete(); circles && circles.delete();
       gray = new cv.Mat();
       circles = new cv.Mat();
       processing = true; els.btnPause.disabled=false; els.btnResume.disabled=true;
       lastT = performance.now(); frameCount = 0;
       loop();
+    }
+
+    function nmsCircles(list, overlapFactor){
+      // list: array de {x,y,r}
+      list.sort((a,b)=>b.r - a.r); // maiores primeiro
+      const kept = [];
+      for(const c of list){
+        let ok = true;
+        for(const k of kept){
+          const dx = c.x - k.x, dy = c.y - k.y;
+          const d = Math.hypot(dx,dy);
+          const thr = overlapFactor * Math.max(c.r, k.r);
+          if(d < thr){ ok = false; break; }
+        }
+        if(ok) kept.push(c);
+      }
+      return kept;
     }
 
     function loop(){
@@ -218,7 +239,7 @@
         const w = els.video.videoWidth, h = els.video.videoHeight;
         if(!w || !h) return;
         const ctx = els.overlay.getContext('2d');
-        ctx.drawImage(els.video, 0, 0, w, h); // base desenhada (também serve para obter ImageData)
+        ctx.drawImage(els.video, 0, 0, w, h); // base
 
         // pega pixels do overlay e cria Mat
         const imageData = ctx.getImageData(0, 0, w, h);
@@ -229,11 +250,11 @@
         let ksize = parseInt(els.blur.value, 10) || 9; if(ksize % 2 === 0) ksize++;
         cv.GaussianBlur(gray, gray, new cv.Size(ksize, ksize), 2, 2, cv.BORDER_DEFAULT);
 
-        // hough circles
-        const dp = 1.2;            // inverso da razão de resolução
-        const minDist = 10;        // separação mínima entre centros
-        const param1 = 100;        // limiar alto do Canny
-        const param2 = parseInt(els.param2.value,10); // limiar do acumulador (sensibilidade)
+        // hough circles — aumentamos minDist dinamicamente baseado no raio mínimo
+        const dp = 1.3;            // downsample mais agressivo para estabilidade
+        const minDist = Math.max(12, parseInt(els.minR.value,10) * 1.2);
+        const param1 = 120;        // Canny alto
+        const param2 = parseInt(els.param2.value,10);
         const minRadius = parseInt(els.minR.value,10);
         const maxRadius = parseInt(els.maxR.value,10);
 
@@ -241,22 +262,28 @@
         circles = new cv.Mat();
         cv.HoughCircles(gray, circles, cv.HOUGH_GRADIENT, dp, minDist, param1, param2, minRadius, maxRadius);
 
+        // converter para array e aplicar NMS (supressão de overlaps)
+        const arr = [];
+        for (let i = 0; i < circles.cols; ++i) {
+          const x = circles.data32F[i*3];
+          const y = circles.data32F[i*3+1];
+          const r = circles.data32F[i*3+2];
+          if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(r)) arr.push({x,y,r});
+        }
+        const overlapFactor = (parseInt(els.overlap.value,10) || 80) / 100; // 0.5–1.0
+        const kept = nmsCircles(arr, overlapFactor);
+
         // desenha resultado
         ctx.clearRect(0,0,w,h);
         ctx.drawImage(els.video, 0, 0, w, h);
         ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(124,219,102,0.9)'; ctx.fillStyle = 'rgba(124,219,102,0.25)';
         let count = 0;
-        for (let i = 0; i < circles.cols; ++i) {
-          const x = circles.data32F[i*3];
-          const y = circles.data32F[i*3+1];
-          const r = circles.data32F[i*3+2];
-          if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(r)) {
-            count++;
-            ctx.beginPath();
-            ctx.arc(x, y, r, 0, Math.PI*2);
-            ctx.fill();
-            ctx.stroke();
-          }
+        for (const c of kept) {
+          count++;
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, c.r, 0, Math.PI*2);
+          ctx.fill();
+          ctx.stroke();
         }
         els.count.textContent = String(count);
 
