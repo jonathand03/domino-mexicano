@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="pt-br">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Contador de Pontos – Dominó Mexicano</title>
+  <style>
+    :root { --bg:#0b0c10; --card:#151a22; --txt:#f1f5f9; --muted:#9aa4b2; --accent:#7cdb66; }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif}
+    header{
+      padding:12px 16px;
+      display:flex;
+      align-items:center;
+      gap:12px;
+      border-bottom:1px solid #1f2632;
+      position:sticky;
+      top:0;
+      background:linear-gradient(180deg, rgba(11,12,16,.95), rgba(11,12,16,.85));
+      backdrop-filter: blur(8px);
+      z-index:2;
+    }
+    .dot{width:10px;height:10px;border-radius:50%;background:var(--accent);display:inline-block}
+    main{padding:14px;max-width:980px;margin:0 auto}
+    .panel{background:var(--card);border:1px solid #1f2632;border-radius:18px;overflow:hidden}
+    .video-wrap{position:relative;}
+    video, canvas{width:100%;height:auto;display:block}
+    #overlay{position:absolute;left:0;top:0}
+    .controls{display:grid;gap:10px;padding:12px;border-top:1px solid #1f2632}
+    .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+    button, select{appearance:none;background:#202737;color:var(--txt);border:1px solid #2a3345;border-radius:12px;padding:10px 12px;font-size:15px;flex:1;min-width:120px}
+    button:active{transform:scale(.99)}
+    .stat{display:flex;align-items:center;gap:10px;justify-content:space-between;background:#10141c;border:1px dashed #243047;border-radius:14px;padding:10px 12px}
+    .big{font-weight:700;font-size:28px}
+    label{font-size:12px;color:var(--muted)}
+    input[type=range]{width:100%}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px}
+    @media(min-width:720px){.grid{grid-template-columns:1fr 1fr}}
+    .tip{color:var(--muted);font-size:13px;line-height:1.35}
+    footer{padding:16px;color:var(--muted);font-size:12px;text-align:center}
+  </style>
+</head>
+<body>
+  <header>
+    <span class="dot"></span>
+    <div>
+      <div style="font-weight:700">Contador de Pontos – Dominó Mexicano</div>
+      <div style="font-size:12px;color:var(--muted)">abra em https (ou localhost) para a câmera funcionar</div>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div class="video-wrap">
+        <video id="video" playsinline autoplay muted></video>
+        <canvas id="overlay"></canvas>
+      </div>
+      <div class="controls">
+        <div class="row">
+          <button id="btnStart">iniciar câmera</button>
+          <button id="btnPause" disabled>pausar</button>
+          <button id="btnResume" disabled>continuar</button>
+          <button id="btnFlip" disabled>alternar câmera</button>
+          <button id="btnTorch" disabled>lanterna</button>
+        </div>
+        <div class="grid">
+          <div class="stat"><span>total de pontos detectados</span><span id="count" class="big">0</span></div>
+          <div class="stat"><span>fps de processamento</span><span id="fps" class="big">0</span></div>
+        </div>
+        <div class="grid">
+          <div>
+            <label>sensibilidade (hough param2)</label>
+            <input type="range" id="param2" min="8" max="40" step="1" value="20">
+          </div>
+          <div>
+            <label>raio mínimo da bolinha (px)</label>
+            <input type="range" id="minR" min="3" max="40" step="1" value="6">
+          </div>
+          <div>
+            <label>raio máximo da bolinha (px)</label>
+            <input type="range" id="maxR" min="15" max="100" step="1" value="36">
+          </div>
+          <div>
+            <label>suavização (blur kernel)</label>
+            <input type="range" id="blur" min="3" max="19" step="2" value="9">
+          </div>
+        </div>
+        <div class="tip">
+          dicas: use boa iluminação e coloque as peças sobre fundo claro. evite padronagens (ex.: toalhas com bolinhas) para reduzir falsos positivos.
+        </div>
+      </div>
+    </section>
+
+    <footer>feito com opencv.js – funciona nos navegadores modernos de celular</footer>
+  </main>
+
+  <!-- OpenCV.js CDN -->
+  <script async src="https://docs.opencv.org/4.x/opencv.js" onload="onOpenCvReady()" onerror="cvLoadError()"></script>
+
+  <script>
+    let stream = null;
+    let usingEnvFacing = true;
+    let processing = false;
+    let rafId = null;
+    let lastT = 0, frameCount = 0;
+    let torchOn = false;
+
+    const els = {
+      video: document.getElementById('video'),
+      overlay: document.getElementById('overlay'),
+      btnStart: document.getElementById('btnStart'),
+      btnPause: document.getElementById('btnPause'),
+      btnResume: document.getElementById('btnResume'),
+      btnFlip: document.getElementById('btnFlip'),
+      btnTorch: document.getElementById('btnTorch'),
+      count: document.getElementById('count'),
+      fps: document.getElementById('fps'),
+      param2: document.getElementById('param2'),
+      minR: document.getElementById('minR'),
+      maxR: document.getElementById('maxR'),
+      blur: document.getElementById('blur'),
+    };
+
+    function cvLoadError(){ alert('não consegui carregar o OpenCV.js. verifique sua conexão.'); }
+
+    async function startCamera(){
+      stopEverything();
+      const constraints = { video: { facingMode: usingEnvFacing ? { exact: 'environment' } : 'user' }, audio:false };
+      try{
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+      }catch(e){
+        // fallback se exact falhar
+        try{ stream = await navigator.mediaDevices.getUserMedia({ video: true, audio:false }); }
+        catch(err){ alert('não consegui acessar a câmera: ' + err.message); return; }
+      }
+      els.video.srcObject = stream;
+      await els.video.play().catch(()=>{});
+      await new Promise(r => setTimeout(r, 100));
+      resizeCanvas();
+      enableButtons();
+      setupTorchButton();
+      startProcessing();
+    }
+
+    function enableButtons(){
+      els.btnPause.disabled = false;
+      els.btnResume.disabled = true;
+      els.btnFlip.disabled = false;
+      els.btnTorch.disabled = !(stream && stream.getVideoTracks()[0] && stream.getVideoTracks()[0].getCapabilities && 'torch' in stream.getVideoTracks()[0].getCapabilities());
+    }
+
+    function setupTorchButton(){
+      if(!(stream && stream.getVideoTracks()[0])) return;
+      const track = stream.getVideoTracks()[0];
+      const caps = track.getCapabilities ? track.getCapabilities() : {};
+      els.btnTorch.disabled = !('torch' in caps);
+    }
+
+    function stopEverything(){
+      cancelAnimationFrame(rafId);
+      if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+      processing = false;
+      els.count.textContent = '0';
+      els.fps.textContent = '0';
+    }
+
+    function resizeCanvas(){
+      const w = els.video.videoWidth || 1280;
+      const h = els.video.videoHeight || 720;
+      els.overlay.width = w; els.overlay.height = h;
+    }
+
+    // ===== OpenCV pipeline =====
+    let src=null, gray=null, circles=null;
+
+    function onOpenCvReady(){
+      // OpenCV carregado, conecta eventos
+      els.btnStart.addEventListener('click', startCamera);
+      els.btnPause.addEventListener('click', ()=>{ processing=false; els.btnPause.disabled=true; els.btnResume.disabled=false; });
+      els.btnResume.addEventListener('click', ()=>{ processing=true; els.btnPause.disabled=false; els.btnResume.disabled=true; loop(); });
+      els.btnFlip.addEventListener('click', ()=>{ usingEnvFacing = !usingEnvFacing; startCamera(); });
+      els.btnTorch.addEventListener('click', toggleTorch);
+
+      // autostart se possível
+      if (location.protocol === 'https:' || location.hostname === 'localhost') {
+        startCamera();
+      }
+
+      window.addEventListener('resize', resizeCanvas);
+      els.video.addEventListener('loadedmetadata', resizeCanvas);
+    }
+
+    async function toggleTorch(){
+      try{
+        const track = stream && stream.getVideoTracks()[0];
+        if(!track || !track.applyConstraints) return;
+        torchOn = !torchOn;
+        await track.applyConstraints({ advanced: [{ torch: torchOn }] });
+        els.btnTorch.textContent = torchOn ? 'lanterna (on)' : 'lanterna';
+      }catch(e){ console.log('torch indisponível:', e.message); }
+    }
+
+    function startProcessing(){
+      if(!cv || !els.video.videoWidth) return;
+      src && src.delete(); gray && gray.delete(); circles && circles.delete();
+      src = new cv.Mat(els.video.videoHeight, els.video.videoWidth, cv.CV_8UC4);
+      gray = new cv.Mat();
+      circles = new cv.Mat();
+      processing = true; els.btnPause.disabled=false; els.btnResume.disabled=true;
+      lastT = performance.now(); frameCount = 0;
+      loop();
+    }
+
+    function loop(){
+      if(!processing) return;
+      rafId = requestAnimationFrame(loop);
+      try{
+        const w = els.video.videoWidth, h = els.video.videoHeight;
+        if(!w || !h) return;
+        const ctx = els.overlay.getContext('2d');
+        ctx.drawImage(els.video, 0, 0, w, h); // base desenhada (também serve para obter ImageData)
+
+        // pega pixels do overlay e cria Mat
+        const imageData = ctx.getImageData(0, 0, w, h);
+        const frame = cv.matFromImageData(imageData);
+        cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
+
+        // blur (ímpar)
+        let ksize = parseInt(els.blur.value, 10) || 9; if(ksize % 2 === 0) ksize++;
+        cv.GaussianBlur(gray, gray, new cv.Size(ksize, ksize), 2, 2, cv.BORDER_DEFAULT);
+
+        // hough circles
+        const dp = 1.2;            // inverso da razão de resolução
+        const minDist = 10;        // separação mínima entre centros
+        const param1 = 100;        // limiar alto do Canny
+        const param2 = parseInt(els.param2.value,10); // limiar do acumulador (sensibilidade)
+        const minRadius = parseInt(els.minR.value,10);
+        const maxRadius = parseInt(els.maxR.value,10);
+
+        circles.delete();
+        circles = new cv.Mat();
+        cv.HoughCircles(gray, circles, cv.HOUGH_GRADIENT, dp, minDist, param1, param2, minRadius, maxRadius);
+
+        // desenha resultado
+        ctx.clearRect(0,0,w,h);
+        ctx.drawImage(els.video, 0, 0, w, h);
+        ctx.lineWidth = 2; ctx.strokeStyle = 'rgba(124,219,102,0.9)'; ctx.fillStyle = 'rgba(124,219,102,0.25)';
+        let count = 0;
+        for (let i = 0; i < circles.cols; ++i) {
+          const x = circles.data32F[i*3];
+          const y = circles.data32F[i*3+1];
+          const r = circles.data32F[i*3+2];
+          if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(r)) {
+            count++;
+            ctx.beginPath();
+            ctx.arc(x, y, r, 0, Math.PI*2);
+            ctx.fill();
+            ctx.stroke();
+          }
+        }
+        els.count.textContent = String(count);
+
+        // FPS simples
+        frameCount++;
+        const now = performance.now();
+        if (now - lastT >= 1000) {
+          els.fps.textContent = String(frameCount);
+          frameCount = 0; lastT = now;
+        }
+
+        frame.delete();
+      }catch(e){ console.error(e); }
+    }
+
+    // limpeza ao sair
+    window.addEventListener('pagehide', stopEverything);
+  </script>
+</body>
+</html>
